@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 79
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["C90", "E", "F", "I", "N", "UP", "W"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 16
