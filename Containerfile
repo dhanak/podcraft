@@ -33,10 +33,20 @@ RUN mkdir /licenses \
        -o -name NOTICE -o -name ATTRIBUTION.md \) \
        -exec cp --parents '{}' /licenses/ \;
 
-FROM ${SERVER_IMAGE}
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+FROM ${SERVER_IMAGE} AS source
+COPY --chmod=644 nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /dist/ /usr/share/nginx/html/
 COPY --from=builder /licenses/ /licenses/
+USER 101:101
+EXPOSE 8080
+ENTRYPOINT ["nginx"]
+CMD ["-g", "daemon off;"]
+
+# Default target deploys a verified release bundle without a Rust toolchain.
+FROM ${SERVER_IMAGE} AS release
+ARG WEB_DIR=dist
+COPY --chmod=644 nginx.conf /etc/nginx/conf.d/default.conf
+COPY ${WEB_DIR}/ /usr/share/nginx/html/
 USER 101:101
 EXPOSE 8080
 ENTRYPOINT ["nginx"]

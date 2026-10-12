@@ -7,6 +7,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -103,17 +104,69 @@ class Relay(BaseHTTPRequestHandler):
                 process.wait()
 
 
+def container_logs(engine, container):
+    try:
+        subprocess.run(
+            [engine, "logs", "--tail", "50", container],
+            stdout=sys.stderr,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(
+            f"relay: could not read container logs: {error}",
+            file=sys.stderr,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("engine", choices=("podman", "docker"))
     parser.add_argument("container")
     parser.add_argument("port", type=int)
     parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or args.container.startswith("-"):
         parser.error("invalid port or container")
     Relay.engine, Relay.container = args.engine, args.container
     server = HTTPServer(("127.0.0.1", args.port), Relay)
+
+    try:
+        subprocess.run(
+            [
+                args.engine,
+                "exec",
+                args.container,
+                "curl",
+                "--noproxy",
+                "*",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--retry",
+                "3",
+                "--retry-connrefused",
+                "--retry-delay",
+                "1",
+                "--max-time",
+                "1",
+                "--url",
+                "http://127.0.0.1:8080/",
+            ],
+            stdout=subprocess.DEVNULL,
+            timeout=10,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"relay: server startup failed: {error}", file=sys.stderr)
+        container_logs(args.engine, args.container)
+        server.server_close()
+        return 1
+    print(
+        f"Serving http://127.0.0.1:{args.port}/ (offline runtime).",
+        flush=True,
+    )
     if args.detach:
         if os.fork():
             server.server_close()
@@ -129,24 +182,43 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     watcher = subprocess.Popen(
         [args.engine, "wait", args.container],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        text=True,
     )
+    stopping = threading.Event()
+    exit_status = 0
 
     def watch():
-        watcher.wait()
+        nonlocal exit_status
+        output, _ = watcher.communicate()
+        if not stopping.is_set():
+            try:
+                exit_status = int(output.strip())
+                if watcher.returncode or not 0 <= exit_status <= 255:
+                    raise ValueError("container wait failed")
+            except ValueError:
+                exit_status = 1
+                print("relay: container wait failed", file=sys.stderr)
+            if exit_status:
+                print(
+                    f"relay: container exited with status {exit_status}",
+                    file=sys.stderr,
+                )
+                container_logs(args.engine, args.container)
         server.shutdown()
 
-    threading.Thread(target=watch, daemon=True).start()
+    worker = threading.Thread(target=watch, daemon=True)
+    worker.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stopping.set()
         server.server_close()
         if watcher.poll() is None:
             watcher.kill()
-        watcher.wait()
+        worker.join()
         subprocess.run(
             [args.engine, "stop", "--time", "2", args.container],
             stdout=subprocess.DEVNULL,
@@ -154,7 +226,16 @@ def main():
             timeout=5,
             check=False,
         )
+        if not args.debug:
+            subprocess.run(
+                [args.engine, "rm", args.container],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+    return exit_status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
